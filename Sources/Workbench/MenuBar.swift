@@ -13,6 +13,10 @@ final class StatusBarController {
     private let monitor = SystemMonitor()
     /// 主窗口引用，用于从概览跳转回完整界面。
     private weak var mainWindow: NSWindow?
+    /// 鼠标离开 popover 后到真正关闭的宽容期，方便用户短暂移出再回来。
+    private static let closeGrace: TimeInterval = 0.15
+    /// 计划中的延迟关闭任务，便于鼠标重新进入时取消。
+    private var pendingCloseTask: DispatchWorkItem?
 
     /// 创建状态项并绑定弹出行为。
     /// - Parameter mainWindow: 主窗口引用，用于概览中跳转到完整界面。
@@ -47,12 +51,59 @@ final class StatusBarController {
     /// 切换概览面板的显示与隐藏，并在关闭时停止采样以节省资源。
     @objc private func togglePopover() {
         guard let button = statusItem.button else { return }
+        cancelPendingClose()
+        if popover.isShown {
+            closePopover()
+            return
+        }
+        monitor.start()
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        installHoverTracking()
+    }
+
+    /// 安装追踪区域，让鼠标离开 popover 时自动关闭。
+    private func installHoverTracking() {
+        guard let contentView = popover.contentViewController?.view else { return }
+        contentView.trackingAreas.forEach { contentView.removeTrackingArea($0) }
+        let options: NSTrackingArea.Options = [.mouseEnteredAndExited, .activeAlways, .inVisibleRect]
+        let area = NSTrackingArea(rect: .zero, options: options, owner: self, userInfo: nil)
+        contentView.addTrackingArea(area)
+    }
+
+    /// 鼠标进入 popover 内容区域：取消挂起的关闭任务。
+    @objc func mouseEntered(_ event: NSEvent) {
+        cancelPendingClose()
+    }
+
+    /// 鼠标离开 popover 内容区域：稍作宽容后关闭，期间重新进入可取消。
+    @objc func mouseExited(_ event: NSEvent) {
+        schedulePopoverClose()
+    }
+
+    /// 在宽容期后关闭 popover 与采样。
+    private func schedulePopoverClose() {
+        cancelPendingClose()
+        let work = DispatchWorkItem { [weak self] in
+            self?.closePopover()
+        }
+        pendingCloseTask = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.closeGrace, execute: work)
+    }
+
+    /// 取消挂起的延迟关闭。
+    private func cancelPendingClose() {
+        pendingCloseTask?.cancel()
+        pendingCloseTask = nil
+    }
+
+    /// 真正关闭 popover 并停止采样。
+    private func closePopover() {
+        cancelPendingClose()
         if popover.isShown {
             popover.performClose(nil)
+        }
+        if monitor.isRefreshing {
             monitor.stop()
-        } else {
-            monitor.start()
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         }
     }
 }
