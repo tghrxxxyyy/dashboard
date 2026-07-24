@@ -1,0 +1,12 @@
+# SwiftPM 编译缓存
+.build/
+
+# 构建产物（已签名 .app，体积大且不入库）
+dist/
+
+# macOS 垃圾文件
+.DS_Store
+
+# Xcode 工程（本项目用 Swift Package 而非 Xcode 工程）
+*.xcodeproj
+*.xcworkspace
