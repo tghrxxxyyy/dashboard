@@ -57,8 +57,31 @@ final class StatusBarController {
             return
         }
         monitor.start()
+        // 关键：用点击瞬间的鼠标屏幕坐标作为锚点，不依赖 button.window（在 macOS 27 上菜单栏是独立进程窗口，转换不可靠）。
+        let clickScreenPoint = NSEvent.mouseLocation
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        // 稍作延迟，等 popover 完成布局（intrinsicContentSize 定稿）再定位，避免拿到错误的 frame。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
+            self.anchorPopoverBelow(clickScreenPoint: clickScreenPoint)
+        }
         installHoverTracking()
+    }
+
+    /// 用点击瞬间的真实屏幕坐标，把 popover 重新定位到状态项正下方，并夹在屏幕可见区域内。
+    /// 垂直方向使用 `screen.visibleFrame.maxY`（菜单栏正下方的精确位置）而不是硬编码间距，
+    /// 能自适应不同 DPI / 不同菜单栏高度的屏幕。
+    private func anchorPopoverBelow(clickScreenPoint: NSPoint) {
+        guard let popoverWindow = popover.contentViewController?.view.window,
+              let screen = popoverWindow.screen ?? NSScreen.main else { return }
+        let screenFrame = screen.visibleFrame
+        var frame = popoverWindow.frame
+        // 水平居中于点击位置（夹在屏幕可见区域内，左右各留 4pt 间距）。
+        let desiredX = clickScreenPoint.x - frame.width / 2
+        frame.origin.x = min(max(desiredX, screenFrame.minX + 4),
+                              screenFrame.maxX - frame.width - 4)
+        // 垂直方向：把 popover 顶部对齐屏幕可见区顶部（菜单栏正下方，再留 4pt 间距）。
+        frame.origin.y = screenFrame.maxY - frame.height - 4
+        popoverWindow.setFrame(frame, display: true)
     }
 
     /// 安装追踪区域，让鼠标离开 popover 时自动关闭。
