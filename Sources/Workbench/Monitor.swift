@@ -47,6 +47,8 @@ struct RunningProcess: Sendable, Identifiable, Hashable {
     let cpu: Double
     /// 物理内存占比百分比。
     let memory: Double
+    /// 物理内存常驻字节数（RSS）。
+    let memoryBytes: Int64
     /// 进程所属用户。
     let user: String
 
@@ -138,7 +140,7 @@ final class SystemMonitor: ObservableObject {
             let result = await Task.detached(priority: .utility) {
                 let processes = Shell.run(
                     executable: "/bin/ps",
-                    arguments: ["-A", "-o", "pid=,pcpu=,pmem=,user=,comm=", "-r"],
+                    arguments: ["-A", "-o", "pid=,pcpu=,pmem=,rss=,user=,comm=", "-r"],
                     outputLimit: 400_000
                 )
                 let disk = Self.sampleDisk()
@@ -185,7 +187,7 @@ final class SystemMonitor: ObservableObject {
             let result = await Task.detached(priority: .userInitiated) {
                 Shell.run(
                     executable: "/bin/ps",
-                    arguments: ["-o", "pid=,pcpu=,pmem=,user=,comm=", "-p", "\(pid)"],
+                    arguments: ["-o", "pid=,pcpu=,pmem=,rss=,user=,comm=", "-p", "\(pid)"],
                     outputLimit: 20_000
                 )
             }.value
@@ -339,18 +341,20 @@ final class SystemMonitor: ObservableObject {
     /// - Returns: 可用于展示的进程记录。
     private func parseProcesses(_ text: String) -> [RunningProcess] {
         text.split(whereSeparator: \.isNewline).compactMap { line in
-            // 限制为五段，确保命令名中包含空格时仍被完整保留。
-            let parts = line.split(maxSplits: 4, whereSeparator: \.isWhitespace)
-            guard parts.count == 5,
+            // 限制为六段（pid/pcpu/pmem/rss/user/comm），确保命令名包含空格时仍被完整保留。
+            let parts = line.split(maxSplits: 5, whereSeparator: \.isWhitespace)
+            guard parts.count == 6,
                   let pid = Int(parts[0]),
                   let cpu = Double(parts[1]),
-                  let memory = Double(parts[2]) else { return nil }
+                  let memory = Double(parts[2]),
+                  let rss = Int64(parts[3]) else { return nil }
             return RunningProcess(
                 pid: pid,
-                name: String(parts[4]),
+                name: String(parts[5]),
                 cpu: cpu,
                 memory: memory,
-                user: String(parts[3])
+                memoryBytes: rss * 1024,
+                user: String(parts[4])
             )
         }
     }

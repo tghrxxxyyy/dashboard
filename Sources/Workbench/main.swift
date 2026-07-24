@@ -6,6 +6,8 @@ import SwiftUI
 final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 强引用主窗口，支持关闭后从 Dock 重新打开。
     private var mainWindow: NSWindow?
+    /// 菜单栏状态项控制器，提供状态栏图标与资源概览。
+    private var statusItemController: StatusBarController?
 
     /// 应用启动完成后创建并展示唯一主窗口。
     /// - Parameter notification: AppKit 提供的启动完成通知。
@@ -15,6 +17,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainWindow = window
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+
+        // 状态栏图标与概览面板，点击图标即可查看 CPU / 内存及占用 Top 3。
+        statusItemController = StatusBarController(mainWindow: window)
     }
 
     /// 用户点击 Dock 图标时重新显示已经关闭的主窗口。
