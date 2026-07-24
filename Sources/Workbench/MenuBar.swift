@@ -4,15 +4,18 @@ import UniformTypeIdentifiers
 
 /// 菜单栏状态项控制器：在系统状态栏常驻 Workbench 图标，点击弹出资源概览。
 @MainActor
-final class StatusBarController {
+final class StatusBarController: NSObject {
     /// 系统状态栏的常驻条目。
     private let statusItem: NSStatusItem
-    /// 承载概览面板的弹出层。
-    private let popover = NSPopover()
     /// 概览面板使用的数据源。
     private let monitor = SystemMonitor()
     /// 主窗口引用，用于从概览跳转回完整界面。
     private weak var mainWindow: NSWindow?
+    /// 自定义弹出面板：使用 NSPanel 替代 NSPopover，拿到完整的窗口定位/尺寸控制权，
+    /// 彻底摆脱 NSPopover 锚定到状态项底边时把内容顶到菜单栏后面的问题。
+    private var overviewPanel: NSPanel?
+    /// 监听面板外的鼠标点击用于自动关闭。
+    private var outsideClickMonitor: Any?
     /// 鼠标离开 popover 后到真正关闭的宽容期，方便用户短暂移出再回来。
     private static let closeGrace: TimeInterval = 0.15
     /// 计划中的延迟关闭任务，便于鼠标重新进入时取消。
@@ -23,6 +26,7 @@ final class StatusBarController {
     init(mainWindow: NSWindow?) {
         self.mainWindow = mainWindow
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        super.init()
 
         if let button = statusItem.button {
             let config = NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)
@@ -33,77 +37,122 @@ final class StatusBarController {
             button.action = #selector(togglePopover)
             button.target = self
         }
-
-        popover.behavior = .transient
-        let hosting = NSHostingController(
-            rootView: StatusBarOverview(monitor: monitor, openMain: { [weak mainWindow] in
-                mainWindow?.makeKeyAndOrderFront(nil)
-                NSApp.activate(ignoringOtherApps: true)
-            })
-        )
-        // 让 popover 精确贴合 SwiftUI 内容尺寸，避免默认尺寸与渲染尺寸不一致导致的整体错位。
-        if #available(macOS 13.0, *) {
-            hosting.sizingOptions = .intrinsicContentSize
-        }
-        popover.contentViewController = hosting
     }
 
     /// 切换概览面板的显示与隐藏，并在关闭时停止采样以节省资源。
     @objc private func togglePopover() {
-        guard let button = statusItem.button else { return }
-        cancelPendingClose()
-        if popover.isShown {
+        if overviewPanel != nil {
             closePopover()
             return
         }
         monitor.start()
         // 关键：用点击瞬间的鼠标屏幕坐标作为锚点，不依赖 button.window（在 macOS 27 上菜单栏是独立进程窗口，转换不可靠）。
         let clickScreenPoint = NSEvent.mouseLocation
-        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        // 稍作延迟，等 popover 完成布局（intrinsicContentSize 定稿）再定位，避免拿到错误的 frame。
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
-            self.anchorPopoverBelow(clickScreenPoint: clickScreenPoint)
+        showOverviewPanel(at: clickScreenPoint)
+    }
+
+    /// 创建并显示概览面板：先让 SwiftUI 完成布局拿到真实尺寸，再把面板顶边精准对齐菜单栏下方 4pt。
+    /// - Parameter screenPoint: 状态项被点击时的鼠标屏幕坐标（用于水平居中）。
+    private func showOverviewPanel(at screenPoint: NSPoint) {
+        // 构建 SwiftUI 内容
+        let contentView = StatusBarOverview(monitor: monitor, openMain: { [weak self] in
+            self?.mainWindow?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            self?.closePopover()
+        })
+        let hosting = NSHostingController(rootView: contentView)
+        if #available(macOS 13.0, *) {
+            hosting.sizingOptions = .intrinsicContentSize
         }
-        installHoverTracking()
+
+        // 用无边框浮动面板取代 NSPopover，避开 NSPopover 把内容顶到菜单栏后面的问题
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 300, height: 200),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.contentViewController = hosting
+        panel.isFloatingPanel = true
+        panel.level = .popUpMenu
+        panel.hasShadow = true
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.titleVisibility = .hidden
+        panel.titlebarAppearsTransparent = true
+        panel.isMovable = false
+
+        // 强制布局 SwiftUI 内容，拿到真实高度（不调用的话 fittingSize 拿到的会是占位尺寸）
+        hosting.view.layoutSubtreeIfNeeded()
+        let fittingSize = hosting.view.fittingSize
+
+        // 用屏幕真实可见区定位（可见区顶部 = 菜单栏正下方）
+        guard let screen = NSScreen.main else { return }
+        let visibleFrame = screen.visibleFrame
+        let width: CGFloat = 300
+        let height: CGFloat = max(fittingSize.height, 200)
+
+        // 水平居中于点击位置，左右各留 8pt 间距
+        var x = screenPoint.x - width / 2
+        x = min(max(x, visibleFrame.minX + 8), visibleFrame.maxX - width - 8)
+        // 顶部对齐菜单栏正下方 4pt：把面板顶边放到 visibleFrame.maxY - height - 4
+        // （macOS 屏幕坐标系 y 向上，面板顶边 y 坐标 = visibleFrame.maxY - height - 4 等价于"面板顶部距离菜单栏底部 4pt"）
+        var y = visibleFrame.maxY - height - 4
+        // 万一高度超过可见区，向上贴底
+        if y < visibleFrame.minY + 8 {
+            y = visibleFrame.minY + 8
+        }
+
+        panel.setFrame(NSRect(x: x, y: y, width: width, height: height), display: true)
+        panel.orderFrontRegardless()
+
+        overviewPanel = panel
+        installHoverTracking(on: hosting.view)
+        installOutsideClickMonitor()
     }
 
-    /// 用点击瞬间的真实屏幕坐标，把 popover 重新定位到状态项正下方，并夹在屏幕可见区域内。
-    /// 垂直方向使用 `screen.visibleFrame.maxY`（菜单栏正下方的精确位置）而不是硬编码间距，
-    /// 能自适应不同 DPI / 不同菜单栏高度的屏幕。
-    private func anchorPopoverBelow(clickScreenPoint: NSPoint) {
-        guard let popoverWindow = popover.contentViewController?.view.window,
-              let screen = popoverWindow.screen ?? NSScreen.main else { return }
-        let screenFrame = screen.visibleFrame
-        var frame = popoverWindow.frame
-        // 水平居中于点击位置（夹在屏幕可见区域内，左右各留 4pt 间距）。
-        let desiredX = clickScreenPoint.x - frame.width / 2
-        frame.origin.x = min(max(desiredX, screenFrame.minX + 4),
-                              screenFrame.maxX - frame.width - 4)
-        // 垂直方向：把 popover 顶部对齐屏幕可见区顶部（菜单栏正下方，再留 4pt 间距）。
-        frame.origin.y = screenFrame.maxY - frame.height - 4
-        popoverWindow.setFrame(frame, display: true)
-    }
-
-    /// 安装追踪区域，让鼠标离开 popover 时自动关闭。
-    private func installHoverTracking() {
-        guard let contentView = popover.contentViewController?.view else { return }
-        contentView.trackingAreas.forEach { contentView.removeTrackingArea($0) }
+    /// 安装追踪区域，让鼠标离开面板时自动关闭。
+    private func installHoverTracking(on view: NSView) {
+        view.trackingAreas.forEach { view.removeTrackingArea($0) }
         let options: NSTrackingArea.Options = [.mouseEnteredAndExited, .activeAlways, .inVisibleRect]
         let area = NSTrackingArea(rect: .zero, options: options, owner: self, userInfo: nil)
-        contentView.addTrackingArea(area)
+        view.addTrackingArea(area)
     }
 
-    /// 鼠标进入 popover 内容区域：取消挂起的关闭任务。
+    /// 监听面板外的鼠标点击，自动关闭。
+    /// - 点击面板本身：忽略（让 SwiftUI 内部按钮处理）
+    /// - 点击状态项：忽略（让 togglePopover 处理切换）
+    /// - 其他位置：关闭面板
+    private func installOutsideClickMonitor() {
+        if let existing = outsideClickMonitor {
+            NSEvent.removeMonitor(existing)
+        }
+        outsideClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+            guard let self = self, let panel = self.overviewPanel else { return event }
+            if event.window === panel { return event }
+            if let statusWindow = self.statusItem.button?.window, event.window === statusWindow {
+                return event
+            }
+            if !panel.frame.contains(NSEvent.mouseLocation) {
+                self.closePopover()
+            }
+            return event
+        }
+    }
+
+    /// 鼠标进入面板内容区域：取消挂起的关闭任务。
     @objc func mouseEntered(_ event: NSEvent) {
         cancelPendingClose()
     }
 
-    /// 鼠标离开 popover 内容区域：稍作宽容后关闭，期间重新进入可取消。
+    /// 鼠标离开面板内容区域：稍作宽容后关闭，期间重新进入可取消。
     @objc func mouseExited(_ event: NSEvent) {
         schedulePopoverClose()
     }
 
-    /// 在宽容期后关闭 popover 与采样。
+    /// 在宽容期后关闭面板与采样。
     private func schedulePopoverClose() {
         cancelPendingClose()
         let work = DispatchWorkItem { [weak self] in
@@ -119,12 +168,15 @@ final class StatusBarController {
         pendingCloseTask = nil
     }
 
-    /// 真正关闭 popover 并停止采样。
+    /// 真正关闭面板并停止采样。
     private func closePopover() {
         cancelPendingClose()
-        if popover.isShown {
-            popover.performClose(nil)
+        if let m = outsideClickMonitor {
+            NSEvent.removeMonitor(m)
+            outsideClickMonitor = nil
         }
+        overviewPanel?.orderOut(nil)
+        overviewPanel = nil
         if monitor.isRefreshing {
             monitor.stop()
         }
